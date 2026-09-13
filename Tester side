@@ -1,1 +1,741 @@
+-- ═══════════════════════════════════════════════════════════════════════════
+--  DUEL SPOOFER - TESTER / RECEIVER SIDE
+--  Shows whatever the ADMIN spoofs, live, on a completely separate client.
+--
+--  HOW IT WORKS
+--    The admin's client pushes {slot, brainrot, gen} to an HTTP relay.
+--    This script long-polls that relay and re-renders the duel card locally:
+--    name, $/s generation, and the real 3D model in a ViewportFrame.
+--
+--    This is required because Roblox executor scripts run CLIENT-SIDE, and
+--    instances an executor creates are never replicated to other players.
+--    Two different accounts therefore need an out-of-band channel (the relay).
+--
+--  SETUP
+--    1. Run the relay:  node relay/server.js
+--    2. Put its public URL in RELAY_URL below (same value on both scripts).
+--    3. Set ROOM to the same string on both scripts.
+--    4. Execute this on the TESTER account.
+-- ═══════════════════════════════════════════════════════════════════════════
 
+-- ── CONFIG ───────────────────────────────────────────────────────────────────
+local CONFIG = {
+    RELAY_URL   = "http://localhost:3000", -- must match the admin script
+    ROOM        = "default",               -- must match the admin script
+    KEY         = "",                      -- must match relay RELAY_KEY (blank = off)
+    LONGPOLL    = 20,                      -- seconds to hold each poll open
+    AUTO_RENDER = true,                    -- draw the 3D model in the viewport
+    TOGGLE_KEY  = Enum.KeyCode.F2,         -- show/hide the panel
+}
+
+-- ── SERVICES ─────────────────────────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local HttpService       = game:GetService("HttpService")
+local RS                = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local LocalPlayer       = Players.LocalPlayer
+
+-- ── THEME (matches the admin GUI) ────────────────────────────────────────────
+local BG      = Color3.fromRGB(10, 10, 15)
+local ACCENT  = Color3.fromRGB(225, 18, 48)
+local BTNGRN  = Color3.fromRGB(38, 178, 92)
+local BTNRED  = Color3.fromRGB(200, 50, 50)
+local TEXT    = Color3.fromRGB(248, 244, 246)
+local SUBTEXT = Color3.fromRGB(160, 160, 180)
+local GOLD    = Color3.fromRGB(255, 215, 0)
+local PANEL   = Color3.fromRGB(25, 25, 35)
+local LINE    = Color3.fromRGB(60, 60, 80)
+
+-- ── HELPERS ──────────────────────────────────────────────────────────────────
+local function GetSafeParent()
+    if typeof(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok and h then return h end
+    end
+    local ok2, pg = pcall(function() return LocalPlayer.PlayerGui end)
+    if ok2 and pg then return pg end
+    return game:GetService("CoreGui")
+end
+
+local function New(cls, props)
+    local ok, obj = pcall(Instance.new, cls)
+    if not ok or not obj then return nil end
+    if props then
+        for k, v in pairs(props) do
+            pcall(function() obj[k] = v end)
+        end
+    end
+    return obj
+end
+
+local function Corner(p, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 6)
+    c.Parent = p
+    return c
+end
+
+local function Stroke(p, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or LINE
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0.3
+    s.Parent = p
+    return s
+end
+
+local function MakeDraggable(frame, handle)
+    handle = handle or frame
+    local dragging, dragStart, startPos = false, nil, nil
+
+    local function update(input)
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            update(input)
+        end
+    end)
+end
+
+-- ── HTTP LAYER (executor-agnostic) ───────────────────────────────────────────
+-- Different executors expose different request functions. Probe for whatever
+-- exists; fall back to game:HttpGet (GET-only) if none is available.
+local function ResolveRequest()
+    local candidates = {
+        (syn and syn.request),
+        (http and http.request),
+        http_request,
+        request,
+        (fluxus and fluxus.request),
+        (krnl and krnl.request),
+    }
+    for _, fn in ipairs(candidates) do
+        if typeof(fn) == "function" then return fn end
+    end
+    return nil
+end
+
+local RequestFn = ResolveRequest()
+
+local function HttpGet(url)
+    if RequestFn then
+        local ok, res = pcall(RequestFn, { Url = url, Method = "GET" })
+        if ok and res then
+            local code = res.StatusCode or res.status_code or 0
+            if code >= 200 and code < 300 then return true, res.Body or res.body or "" end
+            return false, "HTTP " .. tostring(code)
+        end
+        return false, tostring(res)
+    end
+
+    -- Fallback: every mainstream executor exposes one of these.
+    local getter = (syn and syn.http_get) or game.HttpGet
+    local ok, body = pcall(function()
+        if getter == game.HttpGet then return game:HttpGet(url, true) end
+        return getter(url)
+    end)
+    if ok then return true, body end
+    return false, tostring(body)
+end
+
+local function JSONDecode(text)
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(text) end)
+    if ok then return decoded end
+    return nil
+end
+
+local function BuildURL(path, params)
+    local parts = {}
+    for k, v in pairs(params or {}) do
+        local ok, encoded = pcall(function()
+            return HttpService:UrlEncode(tostring(v))
+        end)
+        table.insert(parts, k .. "=" .. (ok and encoded or tostring(v)))
+    end
+    local base = CONFIG.RELAY_URL:gsub("/+$", "")
+    local q = (#parts > 0) and ("?" .. table.concat(parts, "&")) or ""
+    return base .. path .. q
+end
+
+-- ── BRAINROT MODEL RESOLUTION ────────────────────────────────────────────────
+local BrainrotAssets = nil
+pcall(function() BrainrotAssets = require(RS.Shared.BrainrotAssets) end)
+
+local function GetBrainrotModel(name)
+    local model = nil
+    if BrainrotAssets and type(BrainrotAssets.getModel) == "function" then
+        pcall(function()
+            local resolved = BrainrotAssets.getModel(name)
+            if resolved and resolved:IsA("Model") then model = resolved:Clone() end
+        end)
+    end
+    if not model then
+        pcall(function()
+            local cached = RS:FindFirstChild("Models")
+                and RS.Models:FindFirstChild("Animals")
+                and RS.Models.Animals:FindFirstChild(name)
+            if cached then model = cached:Clone() end
+        end)
+    end
+    return model
+end
+
+local function GetGeneration(name)
+    local gen = 0
+    pcall(function()
+        local AnimalData = require(RS.Datas.Animals)
+        if AnimalData and AnimalData[name] then gen = AnimalData[name].Generation or 0 end
+    end)
+    return gen
+end
+
+local function FormatGen(gen)
+    if gen >= 1e12 then return string.format("$%.1fT/s", gen / 1e12)
+    elseif gen >= 1e9 then return string.format("$%.1fB/s", gen / 1e9)
+    elseif gen >= 1e6 then return string.format("$%.1fM/s", gen / 1e6)
+    elseif gen >= 1e3 then return string.format("$%.1fK/s", gen / 1e3)
+    else return "$" .. tostring(math.floor(gen)) .. "/s" end
+end
+
+local function ClearViewport(viewport)
+    if not viewport then return end
+    for _, child in ipairs(viewport:GetChildren()) do
+        pcall(function() child:Destroy() end)
+    end
+end
+
+-- Renders the model into a ViewportFrame, framed and slowly spinning.
+local function RenderModel(viewport, modelName)
+    if not viewport then return false end
+    ClearViewport(viewport)
+    if not CONFIG.AUTO_RENDER then return false end
+
+    local model = GetBrainrotModel(modelName)
+    if not model then return false end
+
+    for _, part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = false
+            part.CanQuery   = false
+            part.CanTouch   = false
+            part.Anchored   = true
+            part.CastShadow = false
+        end
+    end
+
+    local worldModel = Instance.new("WorldModel")
+    worldModel.Parent = viewport
+
+    local camera = Instance.new("Camera")
+    camera.FieldOfView = 50
+    camera.Parent = viewport
+    viewport.CurrentCamera = camera
+
+    model:PivotTo(CFrame.new(0, 0, 0))
+    model.Parent = worldModel
+
+    local extents = model:GetExtentsSize()
+    local maxDim  = math.max(extents.X, extents.Y, extents.Z)
+    local dist    = (maxDim * 0.5 / math.tan(math.rad(25))) * 0.85
+    local origin  = Vector3.new(0, extents.Y * 0.05, 0)
+
+    camera.CFrame = CFrame.new(
+        origin + Vector3.new(-(dist + maxDim * 0.35), extents.Y * 0.1, 0),
+        origin
+    )
+
+    -- Idle animation, if the game ships one for this model.
+    task.spawn(function()
+        task.wait(0.1)
+        pcall(function()
+            local ac = model:FindFirstChildOfClass("AnimationController")
+            if not ac then
+                ac = Instance.new("AnimationController")
+                ac.Parent = model
+            end
+            local animator = ac:FindFirstChildOfClass("Animator")
+            if not animator then
+                animator = Instance.new("Animator")
+                animator.Parent = ac
+            end
+            local animFolder = RS.Animations.Animals:FindFirstChild(modelName)
+            local idle = animFolder and animFolder:FindFirstChild("Idle")
+            if idle then
+                local track = animator:LoadAnimation(idle)
+                track.Looped = true
+                track:Play()
+            end
+        end)
+    end)
+
+    -- Gentle turntable so the tester can see the whole model.
+    task.spawn(function()
+        local angle = 0
+        while viewport.Parent and worldModel.Parent do
+            angle = angle + 0.9
+            pcall(function() model:PivotTo(CFrame.Angles(0, math.rad(angle), 0)) end)
+            task.wait(0.03)
+        end
+    end)
+
+    return true
+end
+
+-- ── GUI ──────────────────────────────────────────────────────────────────────
+local parentGui = GetSafeParent()
+local existing = parentGui:FindFirstChild("DuelSpoofTester")
+if existing then existing:Destroy() end
+
+local sg = New("ScreenGui", {
+    Name = "DuelSpoofTester",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 5001,
+    Parent = parentGui,
+})
+
+local WIN_W, WIN_H = 380, 470
+local win = New("Frame", {
+    Size = UDim2.new(0, WIN_W, 0, WIN_H),
+    Position = UDim2.new(0.5, -WIN_W / 2, 0.2, 0),
+    BackgroundColor3 = BG,
+    BorderSizePixel = 0,
+    Active = true,
+    Parent = sg,
+})
+Corner(win, 8)
+Stroke(win, LINE, 1.5, 0.3)
+
+-- Title bar ------------------------------------------------------------------
+local tbar = New("Frame", {
+    Size = UDim2.new(1, 0, 0, 30),
+    BackgroundColor3 = Color3.fromRGB(16, 9, 12),
+    BackgroundTransparency = 0.2,
+    BorderSizePixel = 0,
+    Parent = win,
+})
+Corner(tbar, 8)
+
+New("TextLabel", {
+    Size = UDim2.new(1, -70, 1, 0),
+    Position = UDim2.new(0, 12, 0, 0),
+    BackgroundTransparency = 1,
+    Text = "📡 Duel Tester — Receiver",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBlack,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = tbar,
+})
+
+local liveDot = New("Frame", {
+    Size = UDim2.new(0, 8, 0, 8),
+    Position = UDim2.new(1, -52, 0.5, -4),
+    BackgroundColor3 = Color3.fromRGB(90, 90, 110),
+    BorderSizePixel = 0,
+    Parent = tbar,
+})
+Corner(liveDot, 4)
+
+local closeBtn = New("TextButton", {
+    Size = UDim2.new(0, 24, 0, 24),
+    Position = UDim2.new(1, -30, 0.5, -12),
+    BackgroundColor3 = BTNRED,
+    Text = "✕",
+    TextColor3 = Color3.fromRGB(255, 255, 255),
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+    Parent = tbar,
+})
+Corner(closeBtn, 5)
+
+MakeDraggable(win, tbar)
+
+local content = New("Frame", {
+    Size = UDim2.new(1, 0, 1, -30),
+    Position = UDim2.new(0, 0, 0, 30),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Parent = win,
+})
+local pad = Instance.new("UIPadding", content)
+pad.PaddingLeft   = UDim.new(0, 10)
+pad.PaddingRight  = UDim.new(0, 10)
+pad.PaddingTop    = UDim.new(0, 8)
+pad.PaddingBottom = UDim.new(0, 8)
+
+local layout = Instance.new("UIListLayout", content)
+layout.Padding = UDim.new(0, 6)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+New("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 14),
+    BackgroundTransparency = 1,
+    Text = "INCOMING SPOOF",
+    TextColor3 = ACCENT,
+    Font = Enum.Font.GothamBold,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    LayoutOrder = 1,
+    Parent = content,
+})
+
+-- Slot cards -----------------------------------------------------------------
+local cardRow = New("Frame", {
+    Size = UDim2.new(1, 0, 0, 190),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    LayoutOrder = 2,
+    Parent = content,
+})
+local cardLayout = Instance.new("UIListLayout", cardRow)
+cardLayout.FillDirection = Enum.FillDirection.Horizontal
+cardLayout.Padding = UDim.new(0, 6)
+cardLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function BuildCard(slotName, color, order)
+    local card = New("Frame", {
+        Size = UDim2.new(0.5, -3, 1, 0),
+        BackgroundColor3 = PANEL,
+        BorderSizePixel = 0,
+        LayoutOrder = order,
+        Parent = cardRow,
+    })
+    Corner(card, 6)
+    local cardStroke = Stroke(card, LINE, 1, 0.3)
+
+    New("Frame", {
+        Size = UDim2.new(1, 0, 0, 2),
+        BackgroundColor3 = color,
+        BorderSizePixel = 0,
+        Parent = card,
+    })
+
+    New("TextLabel", {
+        Size = UDim2.new(1, -12, 0, 12),
+        Position = UDim2.new(0, 8, 0, 6),
+        BackgroundTransparency = 1,
+        Text = slotName:upper() .. " SLOT",
+        TextColor3 = color,
+        Font = Enum.Font.GothamBold,
+        TextSize = 7,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = card,
+    })
+
+    local viewport = New("ViewportFrame", {
+        Size = UDim2.new(1, -16, 0, 104),
+        Position = UDim2.new(0, 8, 0, 22),
+        BackgroundColor3 = Color3.fromRGB(15, 15, 22),
+        BackgroundTransparency = 0,
+        BorderSizePixel = 0,
+        Ambient = Color3.fromRGB(190, 190, 190),
+        LightColor = Color3.fromRGB(255, 255, 255),
+        Parent = card,
+    })
+    Corner(viewport, 5)
+
+    local emptyLbl = New("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "waiting…",
+        TextColor3 = Color3.fromRGB(68, 68, 92),
+        Font = Enum.Font.Gotham,
+        TextSize = 10,
+        Parent = viewport,
+    })
+
+    local nameLbl = New("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 16),
+        Position = UDim2.new(0, 8, 0, 132),
+        BackgroundTransparency = 1,
+        Text = "—",
+        TextColor3 = TEXT,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Parent = card,
+    })
+
+    local genLbl = New("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 14),
+        Position = UDim2.new(0, 8, 0, 150),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = BTNGRN,
+        Font = Enum.Font.GothamBold,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = card,
+    })
+
+    local metaLbl = New("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 12),
+        Position = UDim2.new(0, 8, 0, 166),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = SUBTEXT,
+        Font = Enum.Font.Gotham,
+        TextSize = 7,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = card,
+    })
+
+    return {
+        card = card, stroke = cardStroke, viewport = viewport, empty = emptyLbl,
+        name = nameLbl, gen = genLbl, meta = metaLbl, color = color, lastSeq = -1,
+    }
+end
+
+local cards = {
+    Main  = BuildCard("Main",  ACCENT, 1),
+    Other = BuildCard("Other", GOLD,   2),
+}
+
+-- Event feed -----------------------------------------------------------------
+New("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 14),
+    BackgroundTransparency = 1,
+    Text = "EVENT FEED",
+    TextColor3 = ACCENT,
+    Font = Enum.Font.GothamBold,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    LayoutOrder = 3,
+    Parent = content,
+})
+
+local feed = New("ScrollingFrame", {
+    Size = UDim2.new(1, 0, 0, 150),
+    BackgroundColor3 = Color3.fromRGB(18, 18, 25),
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = ACCENT,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    LayoutOrder = 4,
+    Parent = content,
+})
+Corner(feed, 5)
+Stroke(feed, LINE, 1, 0.3)
+
+local feedLayout = Instance.new("UIListLayout", feed)
+feedLayout.Padding = UDim.new(0, 2)
+feedLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local feedPad = Instance.new("UIPadding", feed)
+feedPad.PaddingLeft   = UDim.new(0, 4)
+feedPad.PaddingRight  = UDim.new(0, 4)
+feedPad.PaddingTop    = UDim.new(0, 4)
+feedPad.PaddingBottom = UDim.new(0, 4)
+
+local statusLbl = New("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 16),
+    BackgroundTransparency = 1,
+    Text = "Connecting to relay…",
+    TextColor3 = SUBTEXT,
+    Font = Enum.Font.Gotham,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    LayoutOrder = 5,
+    Parent = content,
+})
+
+local feedRows, feedOrder = {}, 0
+local function AddFeed(text, color)
+    feedOrder = feedOrder + 1
+    local row = New("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = color or TEXT,
+        Font = Enum.Font.Gotham,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        LayoutOrder = -feedOrder,
+        Parent = feed,
+    })
+    table.insert(feedRows, 1, row)
+    while #feedRows > 40 do
+        local old = table.remove(feedRows)
+        pcall(function() old:Destroy() end)
+    end
+end
+
+-- Flash a card when it receives a new value.
+local function FlashCard(entry)
+    if not entry or not entry.stroke then return end
+    entry.stroke.Color = entry.color
+    entry.stroke.Transparency = 0
+    TweenService:Create(entry.stroke, TweenInfo.new(0.85), {
+        Color = LINE, Transparency = 0.3,
+    }):Play()
+end
+
+-- ── APPLY INCOMING STATE ─────────────────────────────────────────────────────
+local function ApplySlot(slotName, data)
+    local entry = cards[slotName]
+    if not entry then return end
+
+    if not data then
+        if entry.lastSeq ~= -1 then
+            ClearViewport(entry.viewport)
+            entry.empty = New("TextLabel", {
+                Size = UDim2.new(1, 0, 1, 0),
+                BackgroundTransparency = 1,
+                Text = "waiting…",
+                TextColor3 = Color3.fromRGB(68, 68, 92),
+                Font = Enum.Font.Gotham,
+                TextSize = 10,
+                Parent = entry.viewport,
+            })
+            entry.name.Text = "—"
+            entry.gen.Text = ""
+            entry.meta.Text = ""
+            entry.lastSeq = -1
+        end
+        return
+    end
+
+    if entry.lastSeq == data.seq then return end
+    entry.lastSeq = data.seq
+
+    local brainrot = tostring(data.brainrot or "Unknown")
+    local genText = data.genText
+    if not genText or genText == "" then
+        local gen = tonumber(data.gen) or GetGeneration(brainrot)
+        genText = FormatGen(gen)
+    end
+
+    entry.name.Text = brainrot
+    entry.gen.Text  = genText
+    entry.meta.Text = "from " .. tostring(data.admin or "admin") .. " · #" .. tostring(data.seq)
+
+    local rendered = RenderModel(entry.viewport, brainrot)
+    if not rendered then
+        ClearViewport(entry.viewport)
+        New("TextLabel", {
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundTransparency = 1,
+            Text = "🧠\n" .. brainrot,
+            TextColor3 = SUBTEXT,
+            Font = Enum.Font.GothamBold,
+            TextSize = 9,
+            TextWrapped = true,
+            Parent = entry.viewport,
+        })
+    end
+
+    FlashCard(entry)
+    AddFeed("⬇ " .. slotName .. " → " .. brainrot .. "  " .. genText,
+            slotName == "Main" and ACCENT or GOLD)
+    print("📥 [Tester] " .. slotName .. " → " .. brainrot .. " (" .. genText .. ")")
+end
+
+local function ApplyState(state)
+    if not state or not state.slots then return end
+    ApplySlot("Main",  state.slots.Main)
+    ApplySlot("Other", state.slots.Other)
+end
+
+-- ── POLL LOOP ────────────────────────────────────────────────────────────────
+local running = true
+local lastSeq = -1
+local failures = 0
+
+local function SetLive(isLive, message)
+    liveDot.BackgroundColor3 = isLive and BTNGRN or Color3.fromRGB(150, 60, 60)
+    statusLbl.Text = message
+    statusLbl.TextColor3 = isLive and SUBTEXT or Color3.fromRGB(220, 120, 120)
+end
+
+closeBtn.MouseButton1Click:Connect(function()
+    running = false
+    sg:Destroy()
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == CONFIG.TOGGLE_KEY then
+        win.Visible = not win.Visible
+    end
+end)
+
+task.spawn(function()
+    -- Announce which transport we resolved, so debugging is trivial.
+    if RequestFn then
+        print("📡 [Tester] HTTP transport: executor request()")
+    else
+        print("📡 [Tester] HTTP transport: game:HttpGet fallback (GET only)")
+    end
+    AddFeed("• listening on room \"" .. CONFIG.ROOM .. "\"", SUBTEXT)
+
+    while running and sg.Parent do
+        local url = BuildURL("/state", {
+            room  = CONFIG.ROOM,
+            since = lastSeq,
+            wait  = CONFIG.LONGPOLL,
+            key   = CONFIG.KEY,
+        })
+
+        local ok, body = HttpGet(url)
+
+        if ok and body then
+            local data = JSONDecode(body)
+            if data and data.ok then
+                failures = 0
+                if data.seq ~= lastSeq then
+                    lastSeq = data.seq
+                    ApplyState(data)
+                end
+                SetLive(true, "🟢 Live · room \"" .. tostring(data.room) .. "\" · seq " .. tostring(data.seq))
+            else
+                failures = failures + 1
+                SetLive(false, "⚠️ Bad response from relay")
+            end
+        else
+            failures = failures + 1
+            SetLive(false, "🔴 Relay unreachable (" .. tostring(body) .. ")")
+            if failures == 1 then
+                AddFeed("✕ cannot reach " .. CONFIG.RELAY_URL, BTNRED)
+            end
+        end
+
+        -- Back off on repeated failure so we don't spam a dead relay.
+        if failures > 0 then
+            task.wait(math.min(1 + failures * 1.5, 10))
+        else
+            task.wait(0.15)
+        end
+    end
+end)
+
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+print("📡 Duel Tester (Receiver) Loaded!")
+print("   Relay : " .. CONFIG.RELAY_URL)
+print("   Room  : " .. CONFIG.ROOM)
+print("   " .. tostring(CONFIG.TOGGLE_KEY) .. " toggles the panel")
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

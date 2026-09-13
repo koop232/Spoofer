@@ -113,55 +113,141 @@ local function MakeDraggable(frame, handle)
     end)
 end
 
--- ── BROADCAST TO RECEIVER (Improved) ─────────────────────
+-- ── RELAY CONFIG ─────────────────────────────────────────
+-- The tester runs on a DIFFERENT client. Instances created by an executor are
+-- never replicated to other players, so local folders/attributes can't reach
+-- them. We push over HTTP to a small relay that the tester long-polls instead.
+-- Keep RELAY_URL / ROOM / KEY identical in "Tester side".
+local CONFIG = {
+    RELAY_URL = "http://localhost:3000",
+    ROOM      = "default",
+    KEY       = "",
+    LOCAL_MIRROR = true, -- also set local attributes (same-client receivers)
+}
+
+local HttpService = game:GetService("HttpService")
+
+-- ── HTTP LAYER (executor-agnostic) ───────────────────────
+local function ResolveRequest()
+    local candidates = {
+        (syn and syn.request),
+        (http and http.request),
+        http_request,
+        request,
+        (fluxus and fluxus.request),
+        (krnl and krnl.request),
+    }
+    for _, fn in ipairs(candidates) do
+        if typeof(fn) == "function" then return fn end
+    end
+    return nil
+end
+
+local RequestFn = ResolveRequest()
+
+local function UrlEncode(v)
+    local ok, encoded = pcall(function() return HttpService:UrlEncode(tostring(v)) end)
+    return ok and encoded or tostring(v)
+end
+
+-- POST when the executor supports it; otherwise fall back to a GET query push.
+local function RelaySend(path, payload)
+    local base = CONFIG.RELAY_URL:gsub("/+$", "")
+
+    if RequestFn then
+        local ok, res = pcall(RequestFn, {
+            Url = base .. path,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+        if ok and res then
+            local code = res.StatusCode or res.status_code or 0
+            if code >= 200 and code < 300 then return true, res.Body or res.body end
+            return false, "HTTP " .. tostring(code)
+        end
+        return false, tostring(res)
+    end
+
+    local parts = {}
+    for k, v in pairs(payload) do
+        table.insert(parts, k .. "=" .. UrlEncode(v))
+    end
+    local url = base .. path .. "?" .. table.concat(parts, "&")
+    local ok, body = pcall(function() return game:HttpGet(url, true) end)
+    if ok then return true, body end
+    return false, tostring(body)
+end
+
+-- ── BROADCAST TO RECEIVER (relay + local mirror) ─────────
 local currentSlot = "Main"
 local currentBrainrot = ""
+local lastRelayOk, lastRelayErr = nil, nil
 
-local function BroadcastChoice(slot, name)
+-- Local mirror: only useful for a receiver on the SAME client. Harmless
+-- otherwise, and keeps backwards compatibility with the old receiver script.
+local function MirrorLocally(slot, name)
+    if not CONFIG.LOCAL_MIRROR then return end
+    pcall(function()
+        for _, root in ipairs({ RS, Workspace }) do
+            local folder = root:FindFirstChild("DuelSpoofSync")
+            if not folder then
+                folder = Instance.new("Folder")
+                folder.Name = "DuelSpoofSync"
+                folder.Parent = root
+            end
+            folder:SetAttribute("Slot", slot)
+            folder:SetAttribute("Brainrot", name)
+            folder:SetAttribute("Time", tick())
+        end
+    end)
+end
+
+local function BroadcastChoice(slot, name, genValue, genText)
     currentSlot = slot
     currentBrainrot = name
 
-    local function forceSend()
-        -- ReplicatedStorage (more reliable)
-        local rsFolder = RS:FindFirstChild("DuelSpoofSync")
-        if not rsFolder then
-            rsFolder = Instance.new("Folder")
-            rsFolder.Name = "DuelSpoofSync"
-            rsFolder.Parent = RS
-        end
-        rsFolder:SetAttribute("Slot", currentSlot)
-        rsFolder:SetAttribute("Brainrot", currentBrainrot)
-        rsFolder:SetAttribute("Time", tick())
+    MirrorLocally(slot, name)
 
-        -- Workspace backup
-        local wsFolder = Workspace:FindFirstChild("DuelSpoofSync")
-        if not wsFolder then
-            wsFolder = Instance.new("Folder")
-            wsFolder.Name = "DuelSpoofSync"
-            wsFolder.Parent = Workspace
+    task.spawn(function()
+        local ok, err = RelaySend("/push", {
+            room     = CONFIG.ROOM,
+            key      = CONFIG.KEY,
+            slot     = slot,
+            brainrot = name,
+            gen      = genValue or 0,
+            genText  = genText or "",
+            admin    = LocalPlayer and LocalPlayer.Name or "admin",
+        })
+        lastRelayOk, lastRelayErr = ok, err
+        if ok then
+            print("📡 Relayed → " .. slot .. " = " .. name)
+        else
+            warn("📡 Relay push FAILED (" .. tostring(err) .. ") — is the relay running at "
+                 .. CONFIG.RELAY_URL .. "?")
         end
-        wsFolder:SetAttribute("Slot", currentSlot)
-        wsFolder:SetAttribute("Brainrot", currentBrainrot)
-        wsFolder:SetAttribute("Time", tick())
-    end
-
-    forceSend()
-    print("📡 Broadcasted → " .. slot .. " = " .. name)
+    end)
 end
 
--- Keep forcing every second
+local function BroadcastRevert()
+    currentBrainrot = ""
+    task.spawn(function()
+        local ok, err = RelaySend("/revert", {
+            room  = CONFIG.ROOM,
+            key   = CONFIG.KEY,
+            admin = LocalPlayer and LocalPlayer.Name or "admin",
+        })
+        lastRelayOk, lastRelayErr = ok, err
+        if ok then print("📡 Relayed → REVERT") end
+    end)
+end
+
+-- Keep the local mirror warm for same-client receivers.
 task.spawn(function()
     while true do
         task.wait(1)
         if currentBrainrot ~= "" then
-            pcall(function()
-                local rsFolder = RS:FindFirstChild("DuelSpoofSync")
-                if rsFolder then
-                    rsFolder:SetAttribute("Slot", currentSlot)
-                    rsFolder:SetAttribute("Brainrot", currentBrainrot)
-                    rsFolder:SetAttribute("Time", tick())
-                end
-            end)
+            MirrorLocally(currentSlot, currentBrainrot)
         end
     end
 end)
@@ -534,8 +620,8 @@ local function SwapBrainrot(section, newName, slotName)
         
         print("✅ Swapped " .. oldName .. " → " .. newName .. " (" .. genText .. ")")
         
-        -- Broadcast to receiver
-        BroadcastChoice(slotName or "Main", newName)
+        -- Broadcast to receiver (relay + local mirror)
+        BroadcastChoice(slotName or "Main", newName, gen, genText)
         
         return true, removed
     end
@@ -940,6 +1026,41 @@ local statusLbl = New("TextLabel", {
     Parent = mainContent,
 })
 
+-- Relay/tester link indicator
+local relayLbl = New("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 14),
+    BackgroundTransparency = 1,
+    Text = "📡 relay: checking…",
+    TextColor3 = SUBTEXT,
+    Font = Enum.Font.Gotham,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    LayoutOrder = 5,
+    Parent = mainContent,
+})
+
+task.spawn(function()
+    while relayLbl and relayLbl.Parent do
+        local ok = false
+        local base = CONFIG.RELAY_URL:gsub("/+$", "")
+        if RequestFn then
+            local success, res = pcall(RequestFn, { Url = base .. "/health", Method = "GET" })
+            ok = success and res and (res.StatusCode or res.status_code or 0) == 200
+        else
+            ok = pcall(function() return game:HttpGet(base .. "/health", true) end)
+        end
+
+        if ok then
+            relayLbl.Text = "📡 relay online → room \"" .. CONFIG.ROOM .. "\""
+            relayLbl.TextColor3 = BTNGRN
+        else
+            relayLbl.Text = "📡 relay OFFLINE — tester will not update"
+            relayLbl.TextColor3 = BTNRED
+        end
+        task.wait(5)
+    end
+end)
+
 local brainrotButtons = {}
 
 local function BuildBrainrotList(filter)
@@ -1087,6 +1208,7 @@ MakeActionBtn("REVERT", BTNRED, function()
         if otherData.cash then otherData.cash.Text = "$10/s" end
     end
     
+    BroadcastRevert()
     statusLbl.Text = "↩️ Reverted"
     UpdateSlots()
 end)
@@ -1152,4 +1274,3 @@ end)
 print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 print("⚔️ Duel Swapper + Improved Broadcast Loaded!")
 print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

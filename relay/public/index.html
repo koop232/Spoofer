@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Duel Spoofer Relay</title>
+<style>
+  :root{
+    --bg:#0a0a0f; --panel:#12121b; --panel2:#181823; --line:#2a2a3d;
+    --accent:#e11230; --gold:#ffd700; --green:#26b25c; --text:#f8f4f6; --sub:#8a8aa3;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font-family:ui-sans-serif,system-ui,"Segoe UI",Inter,Roboto,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 60px}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:22px;margin:0;letter-spacing:-.02em}
+  .dot{width:9px;height:9px;border-radius:50%;background:#555;box-shadow:0 0 0 3px rgba(255,255,255,.04)}
+  .dot.live{background:var(--green);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .sub{color:var(--sub);font-size:13px;margin:0 0 22px}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:20px}
+  label{font-size:11px;color:var(--sub);text-transform:uppercase;letter-spacing:.08em;
+        display:block;margin-bottom:5px;font-weight:600}
+  input{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+        padding:9px 11px;border-radius:7px;font-size:13px;min-width:180px;outline:none}
+  input:focus{border-color:var(--accent)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+        padding:16px 18px 18px;position:relative;overflow:hidden;min-height:126px}
+  .card::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--accent)}
+  .card.other::before{background:var(--gold)}
+  .slot{font-size:10px;font-weight:800;letter-spacing:.14em;color:var(--accent)}
+  .card.other .slot{color:var(--gold)}
+  .name{font-size:21px;font-weight:800;margin:9px 0 4px;letter-spacing:-.02em;word-break:break-word}
+  .name.empty{color:#44445c;font-weight:600;font-size:16px}
+  .gen{color:var(--green);font-weight:700;font-size:14px}
+  .meta{color:var(--sub);font-size:11px;margin-top:10px}
+  .flash{animation:flash .8s ease-out}
+  @keyframes flash{0%{background:#2a1420;border-color:var(--accent)}100%{background:var(--panel)}}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--sub);
+     margin:0 0 10px;font-weight:700}
+  .log{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+       max-height:340px;overflow:auto}
+  .row{display:flex;gap:12px;align-items:center;padding:10px 16px;
+       border-bottom:1px solid rgba(255,255,255,.05);font-size:13px}
+  .row:last-child{border-bottom:none}
+  .tag{font-size:9px;font-weight:800;letter-spacing:.1em;padding:3px 7px;border-radius:4px;
+       background:rgba(225,18,48,.16);color:#ff5570;white-space:nowrap}
+  .tag.other{background:rgba(255,215,0,.14);color:var(--gold)}
+  .tag.revert{background:rgba(138,138,163,.16);color:var(--sub)}
+  .row .who{margin-left:auto;color:var(--sub);font-size:11px;white-space:nowrap}
+  .empty-log{padding:26px;text-align:center;color:#44445c;font-size:13px}
+  code{background:var(--panel2);padding:2px 6px;border-radius:4px;font-size:12px;color:#b9b9d4}
+  .hint{margin-top:22px;color:var(--sub);font-size:12px;line-height:1.65}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>Duel Spoofer Relay</h1>
+    <span class="sub" style="margin:0" id="stat">connecting…</span>
+  </header>
+  <p class="sub">Live view of what the <strong>tester</strong> client is receiving. Admin pushes land here instantly.</p>
+
+  <div class="bar">
+    <div><label for="room">Room</label><input id="room" value="default" spellcheck="false" /></div>
+  </div>
+
+  <div class="grid">
+    <div class="card" id="card-Main">
+      <div class="slot">MAIN SLOT</div>
+      <div class="name empty" id="name-Main">— no spoof yet —</div>
+      <div class="gen" id="gen-Main"></div>
+      <div class="meta" id="meta-Main"></div>
+    </div>
+    <div class="card other" id="card-Other">
+      <div class="slot">OTHER SLOT</div>
+      <div class="name empty" id="name-Other">— no spoof yet —</div>
+      <div class="gen" id="gen-Other"></div>
+      <div class="meta" id="meta-Other"></div>
+    </div>
+  </div>
+
+  <h2>Event feed</h2>
+  <div class="log" id="log"><div class="empty-log">Waiting for the admin to push a spoof…</div></div>
+
+  <p class="hint">
+    Relay endpoints — <code>POST /push</code> · <code>POST /revert</code> ·
+    <code>GET /state?room=&amp;since=&amp;wait=</code> · <code>GET /health</code><br />
+    Point both Lua scripts' <code>RELAY_URL</code> at this page's origin and set the same <code>ROOM</code>.
+  </p>
+</div>
+
+<script>
+  const roomInput = document.getElementById('room');
+  const dot = document.getElementById('dot');
+  const stat = document.getElementById('stat');
+  const log = document.getElementById('log');
+  const lastSeen = { Main: null, Other: null };
+  let lastSeq = -1;
+
+  const saved = localStorage.getItem('spoofer-room');
+  if (saved) roomInput.value = saved;
+  roomInput.addEventListener('change', () => {
+    localStorage.setItem('spoofer-room', roomInput.value.trim() || 'default');
+    lastSeq = -1;
+    lastSeen.Main = lastSeen.Other = null;
+  });
+
+  const ago = (ts) => {
+    const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    return Math.floor(s / 3600) + 'h ago';
+  };
+
+  function paintSlot(slot, data) {
+    const name = document.getElementById('name-' + slot);
+    const gen = document.getElementById('gen-' + slot);
+    const meta = document.getElementById('meta-' + slot);
+    const card = document.getElementById('card-' + slot);
+
+    if (!data) {
+      name.textContent = '— no spoof yet —';
+      name.className = 'name empty';
+      gen.textContent = '';
+      meta.textContent = '';
+      return;
+    }
+    name.textContent = data.brainrot;
+    name.className = 'name';
+    gen.textContent = data.genText || '';
+    meta.textContent = 'pushed by ' + (data.admin || 'admin') + ' · ' + ago(data.at) + ' · #' + data.seq;
+
+    if (lastSeen[slot] !== data.seq) {
+      lastSeen[slot] = data.seq;
+      card.classList.remove('flash');
+      void card.offsetWidth;
+      card.classList.add('flash');
+    }
+  }
+
+  function paintLog(events) {
+    if (!events || !events.length) {
+      log.innerHTML = '<div class="empty-log">Waiting for the admin to push a spoof…</div>';
+      return;
+    }
+    log.innerHTML = events.map((e) => {
+      if (e.type === 'revert') {
+        return '<div class="row"><span class="tag revert">REVERT</span>' +
+               '<span>both slots cleared</span>' +
+               '<span class="who">' + (e.admin || 'admin') + ' · ' + ago(e.at) + '</span></div>';
+      }
+      const cls = e.slot === 'Other' ? 'tag other' : 'tag';
+      return '<div class="row"><span class="' + cls + '">' + e.slot.toUpperCase() + '</span>' +
+             '<span><strong>' + escapeHtml(e.brainrot) + '</strong> ' +
+             (e.genText ? '<span style="color:var(--green)"> ' + escapeHtml(e.genText) + '</span>' : '') +
+             '</span><span class="who">' + escapeHtml(e.admin || 'admin') + ' · ' + ago(e.at) + '</span></div>';
+    }).join('');
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  async function tick() {
+    const room = encodeURIComponent(roomInput.value.trim() || 'default');
+    try {
+      const res = await fetch('state?room=' + room + '&since=-1', { cache: 'no-store' });
+      const data = await res.json();
+      dot.className = 'dot live';
+      stat.textContent = 'connected · room "' + data.room + '" · seq ' + data.seq;
+      paintSlot('Main', data.slots.Main);
+      paintSlot('Other', data.slots.Other);
+      if (data.seq !== lastSeq) { paintLog(data.events); lastSeq = data.seq; }
+    } catch (err) {
+      dot.className = 'dot';
+      stat.textContent = 'relay unreachable — is the server running?';
+    }
+  }
+
+  tick();
+  setInterval(tick, 1000);
+</script>
+</body>
+</html>
