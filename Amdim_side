@@ -113,31 +113,46 @@ local function MakeDraggable(frame, handle)
     end)
 end
 
--- ── RELAY CONFIG ─────────────────────────────────────────
+-- ── GITHUB SYNC CONFIG ───────────────────────────────────
 -- The tester runs on a DIFFERENT client. Instances created by an executor are
--- never replicated to other players, so local folders/attributes can't reach
--- them. We push over HTTP to a small relay that the tester long-polls instead.
--- Keep RELAY_URL / ROOM / KEY identical in "Tester side".
+-- never replicated, so local folders/attributes can't reach them. Instead the
+-- admin WRITES state into a GitHub Gist and the tester POLLS that same Gist.
+-- No server to host, nothing to keep running -- GitHub is the middleman.
+--
+-- SETUP (see README):
+--   1. Make a token at https://github.com/settings/tokens  (classic, scope: gist)
+--   2. Put it in TOKEN below. Run this script once -- it creates the Gist and
+--      prints the GIST_ID. Copy that ID into BOTH scripts.
+--   3. The tester needs its own token too (any scope; public_repo is enough).
+--      GitHub only gives free 304 polling to AUTHENTICATED requests.
 local CONFIG = {
-    RELAY_URL = "http://localhost:3000",
-    ROOM      = "default",
-    KEY       = "",
-    LOCAL_MIRROR = true, -- also set local attributes (same-client receivers)
+    TOKEN   = "",        -- GitHub token with "gist" scope  (ADMIN: needs write)
+    GIST_ID = "",        -- leave blank on first run; script creates one & prints it
+    ROOM    = "default", -- must match the tester; separates concurrent sessions
+    PUBLIC_GIST  = false, -- secret gist (still readable by anyone with the ID)
+    LOCAL_MIRROR = true,  -- also set local attributes (same-client receivers)
 }
 
 local HttpService = game:GetService("HttpService")
 
+local GITHUB_API = "https://api.github.com"
+local function StateFileName() return "spoof-" .. tostring(CONFIG.ROOM) .. ".json" end
+
 -- ── HTTP LAYER (executor-agnostic) ───────────────────────
 local function ResolveRequest()
-    local candidates = {
-        (syn and syn.request),
-        (http and http.request),
-        http_request,
-        request,
-        (fluxus and fluxus.request),
-        (krnl and krnl.request),
-    }
-    for _, fn in ipairs(candidates) do
+    -- NOTE: build this list with explicit indices and walk it with a numeric
+    -- for. A table constructor whose leading entries are nil has an undefined
+    -- border, so ipairs() would stop at the first hole and miss a bare
+    -- request() -- which is exactly what most executors expose.
+    local candidates = {}
+    candidates[1] = (syn and syn.request) or nil
+    candidates[2] = (http and http.request) or nil
+    candidates[3] = http_request
+    candidates[4] = request
+    candidates[5] = (fluxus and fluxus.request) or nil
+    candidates[6] = (krnl and krnl.request) or nil
+    for i = 1, 6 do
+        local fn = candidates[i]
         if typeof(fn) == "function" then return fn end
     end
     return nil
@@ -145,44 +160,121 @@ end
 
 local RequestFn = ResolveRequest()
 
-local function UrlEncode(v)
-    local ok, encoded = pcall(function() return HttpService:UrlEncode(tostring(v)) end)
-    return ok and encoded or tostring(v)
-end
-
--- POST when the executor supports it; otherwise fall back to a GET query push.
-local function RelaySend(path, payload)
-    local base = CONFIG.RELAY_URL:gsub("/+$", "")
-
-    if RequestFn then
-        local ok, res = pcall(RequestFn, {
-            Url = base .. path,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode(payload),
-        })
-        if ok and res then
-            local code = res.StatusCode or res.status_code or 0
-            if code >= 200 and code < 300 then return true, res.Body or res.body end
-            return false, "HTTP " .. tostring(code)
-        end
-        return false, tostring(res)
+-- Writing to GitHub needs real POST/PATCH with headers. game:HttpGet cannot do
+-- that, so the ADMIN side genuinely requires an executor with request().
+local function GitHubRequest(method, path, bodyTable)
+    if not RequestFn then
+        return nil, 0, "executor has no request() function - cannot write to GitHub"
     end
 
-    local parts = {}
-    for k, v in pairs(payload) do
-        table.insert(parts, k .. "=" .. UrlEncode(v))
+    local opts = {
+        Url = GITHUB_API .. path,
+        Method = method,
+        Headers = {
+            ["Accept"]               = "application/vnd.github+json",
+            ["X-GitHub-Api-Version"] = "2022-11-28",
+            ["Content-Type"]         = "application/json",
+            ["User-Agent"]           = "DuelSpoofer",
+        },
+    }
+    if CONFIG.TOKEN ~= "" then
+        opts.Headers["Authorization"] = "Bearer " .. CONFIG.TOKEN
     end
-    local url = base .. path .. "?" .. table.concat(parts, "&")
-    local ok, body = pcall(function() return game:HttpGet(url, true) end)
-    if ok then return true, body end
-    return false, tostring(body)
+    if bodyTable then
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(bodyTable) end)
+        if not ok then return nil, 0, "encode failed" end
+        opts.Body = encoded
+    end
+
+    local ok, res = pcall(RequestFn, opts)
+    if not ok or not res then return nil, 0, tostring(res) end
+
+    local code = res.StatusCode or res.status_code or 0
+    local body = res.Body or res.body or ""
+    if code < 200 or code >= 300 then
+        local msg = body
+        local decoded = nil
+        pcall(function() decoded = HttpService:JSONDecode(body) end)
+        if decoded and decoded.message then msg = decoded.message end
+        return nil, code, tostring(msg)
+    end
+
+    local decoded = nil
+    pcall(function() decoded = HttpService:JSONDecode(body) end)
+    return decoded, code, nil
 end
 
--- ── BROADCAST TO RECEIVER (relay + local mirror) ─────────
+-- ── GIST STATE ───────────────────────────────────────────
+-- One JSON file per room inside a single Gist. Shape:
+--   { seq, updated, admin, slots = { Main = {...}, Other = {...} } }
+local state = {
+    seq = 0,
+    updated = 0,
+    admin = "admin",
+    slots = {},
+}
+
+local gistReady = false
+local lastSyncOk, lastSyncErr = nil, nil
+
+local function EncodeState()
+    state.admin = (LocalPlayer and LocalPlayer.Name) or "admin"
+    state.updated = os.time()
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(state) end)
+    return ok and encoded or "{}"
+end
+
+-- Push current state up to the Gist (PATCH = overwrite that one file).
+local function WriteGist()
+    if CONFIG.GIST_ID == "" then return false, "no GIST_ID" end
+    local files = {}
+    files[StateFileName()] = { content = EncodeState() }
+    local _, code, err = GitHubRequest("PATCH", "/gists/" .. CONFIG.GIST_ID, { files = files })
+    if err then
+        lastSyncOk, lastSyncErr = false, err
+        warn("📡 GitHub write failed (" .. tostring(code) .. "): " .. tostring(err))
+        return false, err
+    end
+    lastSyncOk, lastSyncErr = true, nil
+    return true
+end
+
+-- Create the Gist on first run and print the ID for the user to copy.
+local function EnsureGist()
+    if CONFIG.GIST_ID ~= "" then
+        gistReady = true
+        return true
+    end
+    if CONFIG.TOKEN == "" then
+        warn("📡 No TOKEN set - cannot create a Gist. See README.")
+        return false
+    end
+
+    local files = {}
+    files[StateFileName()] = { content = EncodeState() }
+    local data, code, err = GitHubRequest("POST", "/gists", {
+        description = "Duel Spoofer sync",
+        public = CONFIG.PUBLIC_GIST and true or false,
+        files = files,
+    })
+    if err or not data or not data.id then
+        warn("📡 Could not create Gist (" .. tostring(code) .. "): " .. tostring(err))
+        return false
+    end
+
+    CONFIG.GIST_ID = data.id
+    gistReady = true
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("📡 Created sync Gist. PUT THIS ID IN BOTH SCRIPTS:")
+    print("     GIST_ID = \"" .. tostring(data.id) .. "\"")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    pcall(function() if setclipboard then setclipboard(tostring(data.id)) end end)
+    return true
+end
+
+-- ── BROADCAST TO RECEIVER (GitHub + local mirror) ────────
 local currentSlot = "Main"
 local currentBrainrot = ""
-local lastRelayOk, lastRelayErr = nil, nil
 
 -- Local mirror: only useful for a receiver on the SAME client. Harmless
 -- otherwise, and keeps backwards compatibility with the old receiver script.
@@ -203,43 +295,60 @@ local function MirrorLocally(slot, name)
     end)
 end
 
+-- Serialise writes: GitHub asks for >=1s between mutating calls, and two
+-- in-flight PATCHes can clobber each other. Queue + coalesce instead.
+local writeQueued = false
+local writing = false
+local lastWriteAt = 0
+
+local function RequestWrite()
+    writeQueued = true
+    if writing then return end
+    writing = true
+    task.spawn(function()
+        while writeQueued do
+            writeQueued = false
+            local gap = os.clock() - lastWriteAt
+            if gap < 1.1 then task.wait(1.1 - gap) end
+            lastWriteAt = os.clock()
+            WriteGist()
+        end
+        writing = false
+    end)
+end
+
 local function BroadcastChoice(slot, name, genValue, genText)
     currentSlot = slot
     currentBrainrot = name
 
     MirrorLocally(slot, name)
 
-    task.spawn(function()
-        local ok, err = RelaySend("/push", {
-            room     = CONFIG.ROOM,
-            key      = CONFIG.KEY,
-            slot     = slot,
-            brainrot = name,
-            gen      = genValue or 0,
-            genText  = genText or "",
-            admin    = LocalPlayer and LocalPlayer.Name or "admin",
-        })
-        lastRelayOk, lastRelayErr = ok, err
-        if ok then
-            print("📡 Relayed → " .. slot .. " = " .. name)
-        else
-            warn("📡 Relay push FAILED (" .. tostring(err) .. ") — is the relay running at "
-                 .. CONFIG.RELAY_URL .. "?")
-        end
-    end)
+    state.seq = state.seq + 1
+    state.slots[slot] = {
+        slot     = slot,
+        brainrot = name,
+        gen      = genValue or 0,
+        genText  = genText or "",
+        seq      = state.seq,
+        at       = os.time(),
+    }
+
+    if not gistReady then
+        if not EnsureGist() then return end
+    end
+    RequestWrite()
+    print("📡 Synced → " .. slot .. " = " .. name)
 end
 
 local function BroadcastRevert()
     currentBrainrot = ""
-    task.spawn(function()
-        local ok, err = RelaySend("/revert", {
-            room  = CONFIG.ROOM,
-            key   = CONFIG.KEY,
-            admin = LocalPlayer and LocalPlayer.Name or "admin",
-        })
-        lastRelayOk, lastRelayErr = ok, err
-        if ok then print("📡 Relayed → REVERT") end
-    end)
+    state.seq = state.seq + 1
+    state.slots = {}
+    if not gistReady then
+        if not EnsureGist() then return end
+    end
+    RequestWrite()
+    print("📡 Synced → REVERT")
 end
 
 -- Keep the local mirror warm for same-client receivers.
@@ -250,6 +359,10 @@ task.spawn(function()
             MirrorLocally(currentSlot, currentBrainrot)
         end
     end
+end)
+
+task.spawn(function()
+    if CONFIG.TOKEN ~= "" then EnsureGist() end
 end)
 
 -- ── FIND PLAYER'S PLOT ──────────────────────────────────
@@ -1026,11 +1139,11 @@ local statusLbl = New("TextLabel", {
     Parent = mainContent,
 })
 
--- Relay/tester link indicator
+-- GitHub sync indicator
 local relayLbl = New("TextLabel", {
     Size = UDim2.new(1, 0, 0, 14),
     BackgroundTransparency = 1,
-    Text = "📡 relay: checking…",
+    Text = "📡 github: checking…",
     TextColor3 = SUBTEXT,
     Font = Enum.Font.Gotham,
     TextSize = 8,
@@ -1041,23 +1154,26 @@ local relayLbl = New("TextLabel", {
 
 task.spawn(function()
     while relayLbl and relayLbl.Parent do
-        local ok = false
-        local base = CONFIG.RELAY_URL:gsub("/+$", "")
-        if RequestFn then
-            local success, res = pcall(RequestFn, { Url = base .. "/health", Method = "GET" })
-            ok = success and res and (res.StatusCode or res.status_code or 0) == 200
-        else
-            ok = pcall(function() return game:HttpGet(base .. "/health", true) end)
-        end
-
-        if ok then
-            relayLbl.Text = "📡 relay online → room \"" .. CONFIG.ROOM .. "\""
+        if not RequestFn then
+            relayLbl.Text = "📡 executor can't POST — admin needs request()"
+            relayLbl.TextColor3 = BTNRED
+        elseif CONFIG.TOKEN == "" then
+            relayLbl.Text = "📡 no TOKEN set — see README"
+            relayLbl.TextColor3 = BTNRED
+        elseif CONFIG.GIST_ID == "" then
+            relayLbl.Text = "📡 creating gist…"
+            relayLbl.TextColor3 = GOLD
+        elseif lastSyncOk == false then
+            relayLbl.Text = "📡 sync FAILED: " .. tostring(lastSyncErr or "?"):sub(1, 32)
+            relayLbl.TextColor3 = BTNRED
+        elseif lastSyncOk == true then
+            relayLbl.Text = "📡 synced → room \"" .. CONFIG.ROOM .. "\""
             relayLbl.TextColor3 = BTNGRN
         else
-            relayLbl.Text = "📡 relay OFFLINE — tester will not update"
-            relayLbl.TextColor3 = BTNRED
+            relayLbl.Text = "📡 ready → room \"" .. CONFIG.ROOM .. "\""
+            relayLbl.TextColor3 = SUBTEXT
         end
-        task.wait(5)
+        task.wait(2)
     end
 end)
 

@@ -3,29 +3,37 @@
 --  Shows whatever the ADMIN spoofs, live, on a completely separate client.
 --
 --  HOW IT WORKS
---    The admin's client pushes {slot, brainrot, gen} to an HTTP relay.
---    This script long-polls that relay and re-renders the duel card locally:
---    name, $/s generation, and the real 3D model in a ViewportFrame.
+--    The admin writes the spoof into a GitHub Gist. This script polls that
+--    Gist and re-renders the duel card locally: name, $/s generation, and the
+--    real 3D model in a ViewportFrame. GitHub is the middleman -- there is no
+--    server to host and nothing to keep running.
 --
 --    This is required because Roblox executor scripts run CLIENT-SIDE, and
 --    instances an executor creates are never replicated to other players.
---    Two different accounts therefore need an out-of-band channel (the relay).
+--    Two different accounts therefore need an out-of-band channel.
+--
+--  WHY THE TESTER ALSO NEEDS A TOKEN
+--    Polling uses conditional requests (ETag / If-None-Match). GitHub only
+--    exempts a 304 from the rate limit when the request is AUTHENTICATED:
+--    authenticated = 5000/hour and 304s are free, so ~1.5s polling is fine.
+--    Unauthenticated = 60/hour and 304s STILL count -- about one check a
+--    minute, which is useless for duels. Any token works (no scopes needed
+--    for a public gist; "gist" scope if the admin made it secret).
 --
 --  SETUP
---    1. Run the relay:  node relay/server.js
---    2. Put its public URL in RELAY_URL below (same value on both scripts).
---    3. Set ROOM to the same string on both scripts.
---    4. Execute this on the TESTER account.
+--    1. Admin runs their script once -> it prints a GIST_ID.
+--    2. Put that GIST_ID and your own token below.
+--    3. ROOM must match the admin's ROOM.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 -- ── CONFIG ───────────────────────────────────────────────────────────────────
 local CONFIG = {
-    RELAY_URL   = "http://localhost:3000", -- must match the admin script
-    ROOM        = "default",               -- must match the admin script
-    KEY         = "",                      -- must match relay RELAY_KEY (blank = off)
-    LONGPOLL    = 20,                      -- seconds to hold each poll open
-    AUTO_RENDER = true,                    -- draw the 3D model in the viewport
-    TOGGLE_KEY  = Enum.KeyCode.F2,         -- show/hide the panel
+    TOKEN      = "",         -- your GitHub token (see note above)
+    GIST_ID    = "",         -- printed by the admin script on first run
+    ROOM       = "default",  -- must match the admin script
+    POLL       = 1.5,        -- seconds between polls (304s are free when authed)
+    AUTO_RENDER = true,      -- draw the 3D model in the viewport
+    TOGGLE_KEY = Enum.KeyCode.F2, -- show/hide the panel
 }
 
 -- ── SERVICES ─────────────────────────────────────────────────────────────────
@@ -119,15 +127,19 @@ end
 -- Different executors expose different request functions. Probe for whatever
 -- exists; fall back to game:HttpGet (GET-only) if none is available.
 local function ResolveRequest()
-    local candidates = {
-        (syn and syn.request),
-        (http and http.request),
-        http_request,
-        request,
-        (fluxus and fluxus.request),
-        (krnl and krnl.request),
-    }
-    for _, fn in ipairs(candidates) do
+    -- NOTE: build this list with explicit indices and walk it with a numeric
+    -- for. A table constructor whose leading entries are nil has an undefined
+    -- border, so ipairs() would stop at the first hole and miss a bare
+    -- request() -- which is exactly what most executors expose.
+    local candidates = {}
+    candidates[1] = (syn and syn.request) or nil
+    candidates[2] = (http and http.request) or nil
+    candidates[3] = http_request
+    candidates[4] = request
+    candidates[5] = (fluxus and fluxus.request) or nil
+    candidates[6] = (krnl and krnl.request) or nil
+    for i = 1, 6 do
+        local fn = candidates[i]
         if typeof(fn) == "function" then return fn end
     end
     return nil
@@ -135,26 +147,8 @@ end
 
 local RequestFn = ResolveRequest()
 
-local function HttpGet(url)
-    if RequestFn then
-        local ok, res = pcall(RequestFn, { Url = url, Method = "GET" })
-        if ok and res then
-            local code = res.StatusCode or res.status_code or 0
-            if code >= 200 and code < 300 then return true, res.Body or res.body or "" end
-            return false, "HTTP " .. tostring(code)
-        end
-        return false, tostring(res)
-    end
-
-    -- Fallback: every mainstream executor exposes one of these.
-    local getter = (syn and syn.http_get) or game.HttpGet
-    local ok, body = pcall(function()
-        if getter == game.HttpGet then return game:HttpGet(url, true) end
-        return getter(url)
-    end)
-    if ok then return true, body end
-    return false, tostring(body)
-end
+local GITHUB_API = "https://api.github.com"
+local function StateFileName() return "spoof-" .. tostring(CONFIG.ROOM) .. ".json" end
 
 local function JSONDecode(text)
     local ok, decoded = pcall(function() return HttpService:JSONDecode(text) end)
@@ -162,17 +156,54 @@ local function JSONDecode(text)
     return nil
 end
 
-local function BuildURL(path, params)
-    local parts = {}
-    for k, v in pairs(params or {}) do
-        local ok, encoded = pcall(function()
-            return HttpService:UrlEncode(tostring(v))
-        end)
-        table.insert(parts, k .. "=" .. (ok and encoded or tostring(v)))
+-- Conditional GET against the Gist. Returns: status, decodedBody, newEtag
+--   304 -> nothing changed (free when authenticated)
+--   200 -> changed, body decoded
+local function GitHubGet(path, etag)
+    local url = GITHUB_API .. path
+
+    if RequestFn then
+        local headers = {
+            ["Accept"]               = "application/vnd.github+json",
+            ["X-GitHub-Api-Version"] = "2022-11-28",
+            ["User-Agent"]           = "DuelSpoofer",
+        }
+        if CONFIG.TOKEN ~= "" then
+            headers["Authorization"] = "Bearer " .. CONFIG.TOKEN
+        end
+        if etag and etag ~= "" then
+            headers["If-None-Match"] = etag
+        end
+
+        local ok, res = pcall(RequestFn, { Url = url, Method = "GET", Headers = headers })
+        if not ok or not res then return 0, nil, etag, tostring(res) end
+
+        local code = res.StatusCode or res.status_code or 0
+        if code == 304 then return 304, nil, etag, nil end
+
+        -- Executors spell the header table differently; check both.
+        local resHeaders = res.Headers or res.headers or {}
+        local newEtag = resHeaders["ETag"] or resHeaders["etag"] or etag
+
+        local body = res.Body or res.body or ""
+        if code < 200 or code >= 300 then
+            local msg = body
+            local decoded = JSONDecode(body)
+            if decoded and decoded.message then msg = decoded.message end
+            return code, nil, etag, tostring(msg)
+        end
+        return code, JSONDecode(body), newEtag, nil
     end
-    local base = CONFIG.RELAY_URL:gsub("/+$", "")
-    local q = (#parts > 0) and ("?" .. table.concat(parts, "&")) or ""
-    return base .. path .. q
+
+    -- Fallback: GET-only, unauthenticated, no ETag. Works, but burns the
+    -- 60/hour unauthenticated budget -- the poll loop slows itself down.
+    local getter = (syn and syn.http_get) or game.HttpGet
+    local ok, body = pcall(function()
+        if getter == game.HttpGet then return game:HttpGet(url, true) end
+        return getter(url)
+    end)
+    if not ok then return 0, nil, etag, tostring(body) end
+    return 200, JSONDecode(body), etag, nil
 end
 
 -- ── BRAINROT MODEL RESOLUTION ────────────────────────────────────────────────
@@ -665,6 +696,9 @@ end
 local running = true
 local lastSeq = -1
 local failures = 0
+local etag = nil
+local stateError = nil
+local pollCount, changeCount = 0, 0
 
 local function SetLive(isLive, message)
     liveDot.BackgroundColor3 = isLive and BTNGRN or Color3.fromRGB(150, 60, 60)
@@ -684,58 +718,111 @@ UserInputService.InputBegan:Connect(function(input, processed)
     end
 end)
 
+-- Pull the room's JSON file out of the Gist payload.
+local function ExtractState(gist)
+    if not gist or not gist.files then return nil, "gist has no files" end
+    local file = gist.files[StateFileName()]
+    if not file then
+        return nil, "no file \"" .. StateFileName() .. "\" (ROOM mismatch?)"
+    end
+    if file.truncated then
+        return nil, "state file truncated"
+    end
+    local decoded = JSONDecode(file.content or "")
+    if not decoded then return nil, "state file is not valid JSON" end
+    return decoded, nil
+end
+
 task.spawn(function()
-    -- Announce which transport we resolved, so debugging is trivial.
+    -- Announce the resolved transport so debugging is trivial.
     if RequestFn then
         print("📡 [Tester] HTTP transport: executor request()")
     else
-        print("📡 [Tester] HTTP transport: game:HttpGet fallback (GET only)")
+        print("📡 [Tester] HTTP transport: game:HttpGet fallback (no ETag, unauthenticated)")
+        warn("📡 [Tester] Without request() every poll costs quota (60/hour). Polling slowly.")
     end
+    if CONFIG.TOKEN == "" then
+        warn("📡 [Tester] No TOKEN set: unauthenticated 304s still count against the "
+             .. "60/hour limit, so updates will be slow. See README.")
+    end
+
     AddFeed("• listening on room \"" .. CONFIG.ROOM .. "\"", SUBTEXT)
 
+    if CONFIG.GIST_ID == "" then
+        SetLive(false, "🔴 No GIST_ID set — see README")
+        AddFeed("✕ GIST_ID is empty", BTNRED)
+        return
+    end
+
+    -- No auth and no ETag means every poll spends one of only 60 per hour.
+    local unauthed = (CONFIG.TOKEN == "" or not RequestFn)
+    local basePoll = math.max(CONFIG.POLL, unauthed and 60 or 0.8)
+
     while running and sg.Parent do
-        local url = BuildURL("/state", {
-            room  = CONFIG.ROOM,
-            since = lastSeq,
-            wait  = CONFIG.LONGPOLL,
-            key   = CONFIG.KEY,
-        })
+        pollCount = pollCount + 1
+        local code, gist, newEtag, err = GitHubGet("/gists/" .. CONFIG.GIST_ID, etag)
 
-        local ok, body = HttpGet(url)
+        if code == 304 then
+            failures = 0
+            -- Nothing changed. If the last decode failed (e.g. ROOM mismatch)
+            -- keep showing that, otherwise the warning would flash once and
+            -- then be replaced by a misleading "Live".
+            if stateError then
+                SetLive(false, "⚠️ " .. tostring(stateError))
+            else
+                SetLive(true, "🟢 Live · room \"" .. CONFIG.ROOM .. "\" · seq " .. tostring(lastSeq))
+            end
 
-        if ok and body then
-            local data = JSONDecode(body)
-            if data and data.ok then
-                failures = 0
-                if data.seq ~= lastSeq then
-                    lastSeq = data.seq
+        elseif code == 200 and gist then
+            failures = 0
+            etag = newEtag
+            local data, perr = ExtractState(gist)
+            if data then
+                stateError = nil
+                changeCount = changeCount + 1
+                local seq = tonumber(data.seq) or 0
+                if seq ~= lastSeq then
+                    lastSeq = seq
                     ApplyState(data)
                 end
-                SetLive(true, "🟢 Live · room \"" .. tostring(data.room) .. "\" · seq " .. tostring(data.seq))
+                SetLive(true, "🟢 Live · room \"" .. CONFIG.ROOM .. "\" · seq " .. tostring(seq))
             else
-                failures = failures + 1
-                SetLive(false, "⚠️ Bad response from relay")
+                if stateError ~= perr then
+                    AddFeed("✕ " .. tostring(perr), BTNRED)
+                end
+                stateError = perr
+                SetLive(false, "⚠️ " .. tostring(perr))
             end
+
+        elseif code == 401 or code == 403 then
+            failures = failures + 1
+            SetLive(false, "🔴 Auth/rate-limit: " .. tostring(err or code))
+            if failures == 1 then AddFeed("✕ " .. tostring(err or code), BTNRED) end
+
+        elseif code == 404 then
+            failures = failures + 1
+            SetLive(false, "🔴 Gist not found — check GIST_ID")
+            if failures == 1 then AddFeed("✕ gist 404 (bad ID, or secret gist needs a token)", BTNRED) end
+
         else
             failures = failures + 1
-            SetLive(false, "🔴 Relay unreachable (" .. tostring(body) .. ")")
-            if failures == 1 then
-                AddFeed("✕ cannot reach " .. CONFIG.RELAY_URL, BTNRED)
-            end
+            SetLive(false, "🔴 GitHub unreachable (" .. tostring(err or code) .. ")")
+            if failures == 1 then AddFeed("✕ " .. tostring(err or code), BTNRED) end
         end
 
-        -- Back off on repeated failure so we don't spam a dead relay.
+        -- Back off on repeated failure so a bad config can't hammer GitHub.
         if failures > 0 then
-            task.wait(math.min(1 + failures * 1.5, 10))
+            task.wait(math.min(basePoll + failures * 2, 30))
         else
-            task.wait(0.15)
+            task.wait(basePoll)
         end
     end
 end)
 
 print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 print("📡 Duel Tester (Receiver) Loaded!")
-print("   Relay : " .. CONFIG.RELAY_URL)
+print("   Gist  : " .. (CONFIG.GIST_ID ~= "" and CONFIG.GIST_ID or "(not set!)"))
 print("   Room  : " .. CONFIG.ROOM)
+print("   Auth  : " .. (CONFIG.TOKEN ~= "" and "token set (fast polling)" or "NONE (slow, 60/hr)"))
 print("   " .. tostring(CONFIG.TOGGLE_KEY) .. " toggles the panel")
 print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
