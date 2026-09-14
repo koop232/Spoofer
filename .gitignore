@@ -1,0 +1,10 @@
+# Local Lua/Python test runtime
+.venv/
+__pycache__/
+*.pyc
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

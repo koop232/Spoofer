@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Syntax, tests, bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Lua runtime
+        run: pip install lupa
+
+      - name: Syntax check
+        run: python tools/syntax_check.py
+
+      - name: Unit tests
+        run: python tools/run_lua.py tests/run_tests.lua
+
+      - name: Bundle is up to date
+        run: python build/bundle.py --check
+
+      - name: Bundle smoke test
+        run: python tools/run_lua.py tests/smoke_bundle.lua
