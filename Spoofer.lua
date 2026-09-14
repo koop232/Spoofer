@@ -36,7 +36,7 @@ local CONFIG = {
     ADMIN_USER = "fmly_funke",   -- compared case-insensitively
 
     -- GITHUB SYNC -----------------------------------------------------------
-    TOKEN   = "",                -- admin: token with `gist` scope (write)
+    TOKEN   = "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",                -- admin: token with `gist` scope (write)
                                  -- tester: any classic token (read)
     GIST_ID = "",                -- blank on the admin's first run; it prints one
     ROOM    = "default",         -- must match on both accounts
