@@ -67,6 +67,9 @@ python3 build/bundle.py
 
 `dist/` is generated output — CI fails if it is stale relative to `src/`.
 
+The CI pipeline lives in [`ci/github-actions.yml`](ci/README.md); move it to
+`.github/workflows/ci.yml` to activate it.
+
 ### Project layout
 
 ```
